@@ -450,6 +450,32 @@ See `database/schema.sql` for complete schema.
 
 ## 🐛 Troubleshooting
 
+### Docker Desktop Issues
+
+**⚠️ ERROR: "Docker Desktop is unable to start"**
+
+This error occurs when WSL 2 (Windows Subsystem for Linux) is not installed.
+
+**Quick Fix:**
+```powershell
+# Run as Administrator
+wsl --install
+# Then restart your computer
+```
+
+**Automated Fix:**
+```powershell
+# Navigate to project directory
+cd medical-claim-system
+
+# Run the fix script as Administrator
+.\fix-docker-desktop.ps1
+```
+
+**Detailed Troubleshooting:**
+- See [Docker Desktop Troubleshooting Guide](./docs/DOCKER_DESKTOP_TROUBLESHOOTING.md)
+- See [Docker Installation Guide](./docs/DOCKER_INSTALLATION_WINDOWS.md)
+
 ### Common Issues
 
 1. **Database connection failed**
@@ -465,6 +491,12 @@ See `database/schema.sql` for complete schema.
    - Check file size limits
    - Verify AWS S3 credentials
    - Check file type restrictions
+
+4. **Docker containers won't start**
+   - Ensure Docker Desktop is running (green icon in system tray)
+   - Check WSL 2 is installed: `wsl --status`
+   - Restart Docker Desktop
+   - Run: `docker-compose down && docker-compose up -d`
 
 ## 🤝 Contributing
 
