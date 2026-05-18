@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
-const { User } = require('../models');
 const logger = require('../utils/logger');
+const { getUserById } = require('../controllers/auth.controller');
 
 /**
  * Verify JWT token and authenticate user
@@ -23,9 +23,7 @@ const authenticate = async (req, res, next) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
         // Get user from database
-        const user = await User.findByPk(decoded.userId, {
-            attributes: { exclude: ['password_hash'] }
-        });
+        const user = await getUserById(decoded.userId);
 
         if (!user) {
             return res.status(401).json({
@@ -41,7 +39,7 @@ const authenticate = async (req, res, next) => {
             });
         }
 
-        // Attach user to request
+        // Attach user to request (password_hash already excluded in getUserById)
         req.user = user;
         next();
     } catch (error) {
@@ -120,9 +118,7 @@ const optionalAuth = async (req, res, next) => {
         if (authHeader && authHeader.startsWith('Bearer ')) {
             const token = authHeader.split(' ')[1];
             const decoded = jwt.verify(token, process.env.JWT_SECRET);
-            const user = await User.findByPk(decoded.userId, {
-                attributes: { exclude: ['password_hash'] }
-            });
+            const user = await getUserById(decoded.userId);
             
             if (user && user.is_active) {
                 req.user = user;

@@ -54,30 +54,37 @@ const CustomerDashboard = () => {
   const fetchDashboardData = async () => {
     try {
       setLoading(true);
+      
       const token = localStorage.getItem('token');
-      
-      // Fetch claims
-      const claimsResponse = await axios.get(
-        `${process.env.REACT_APP_API_URL}/claims`,
-        {
-          headers: { Authorization: `Bearer ${token}` }
-        }
-      );
-      
-      // Fetch statistics
-      const statsResponse = await axios.get(
-        `${process.env.REACT_APP_API_URL}/claims/stats/dashboard`,
-        {
-          headers: { Authorization: `Bearer ${token}` }
-        }
-      );
+      if (!token) {
+        toast.error('Please login to view dashboard');
+        navigate('/login');
+        return;
+      }
 
-      setClaims(claimsResponse.data.data.claims);
-      setStats(statsResponse.data.data);
+      // Fetch real claims from API
+      const response = await axios.get(`${process.env.REACT_APP_API_URL}/api/v1/claims`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      if (response.data.success) {
+        setClaims(response.data.data.claims || []);
+        toast.success('Claims loaded successfully');
+      }
+      
       setLoading(false);
     } catch (error) {
       console.error('Error fetching dashboard data:', error);
-      toast.error('Failed to load dashboard data');
+      if (error.response?.status === 401) {
+        toast.error('Session expired. Please login again.');
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        navigate('/login');
+      } else {
+        toast.error('Failed to load dashboard data');
+      }
       setLoading(false);
     }
   };

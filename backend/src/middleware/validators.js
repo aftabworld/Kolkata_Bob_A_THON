@@ -15,10 +15,16 @@ const validateClaimSubmission = (req, res, next) => {
   next();
 };
 
+const validateClaim = (req, res, next) => {
+  // Placeholder validation for claim creation/update
+  next();
+};
+
 module.exports = {
   validateClaimRequest,
   validateClaimUpdate,
-  validateClaimSubmission
+  validateClaimSubmission,
+  validateClaim
 };
 
 // Made with Bob

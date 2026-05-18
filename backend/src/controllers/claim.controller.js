@@ -1,143 +1,95 @@
-const { sequelize } = require('../config/database');
-const {
-    ClaimRequest,
-    CustomerMaster,
-    InsurancePolicy,
-    ClaimHistory,
-    ClaimComment,
-    ClaimWorkflow,
-    ClaimDocument,
-    User
-} = require('../models');
 const logger = require('../utils/logger');
-const { validateClaimAmount, validatePolicyValidity, validateDocuments } = require('../utils/validators');
-const { sendNotification } = require('../services/notification.service');
-const { calculateRiskScore } = require('../services/fraud-detection.service');
+const { sequelize } = require('../config/database');
 
 /**
- * Create a new claim (Draft)
+ * Create a new claim (Draft or Submit)
  */
 const createClaim = async (req, res) => {
-    const transaction = await sequelize.transaction();
-    
     try {
         const {
-            policy_id,
             claim_amount,
             claim_type,
             treatment_type,
             hospital_name,
+            hospital_address,
             admission_date,
             discharge_date,
             diagnosis,
-            claim_description
+            treatment_details,
+            doctor_name,
+            doctor_registration_no,
+            claim_description,
+            submit = false
         } = req.body;
 
-        // Get customer details
-        const customer = await CustomerMaster.findOne({
-            where: { user_id: req.user.user_id },
-            transaction
-        });
-
-        if (!customer) {
-            await transaction.rollback();
-            return res.status(404).json({
-                success: false,
-                message: 'Customer profile not found'
-            });
-        }
-
-        // Get and validate insurance policy
-        const policy = await InsurancePolicy.findOne({
-            where: {
-                policy_id,
-                customer_id: customer.customer_id,
-                is_active: true
-            },
-            transaction
-        });
-
-        if (!policy) {
-            await transaction.rollback();
-            return res.status(404).json({
-                success: false,
-                message: 'Active insurance policy not found'
-            });
-        }
-
-        // Validate policy validity
-        const policyValidation = validatePolicyValidity(policy);
-        if (!policyValidation.valid) {
-            await transaction.rollback();
+        // Validate required fields
+        if (!claim_amount || !claim_type || !hospital_name || !diagnosis) {
             return res.status(400).json({
                 success: false,
-                message: policyValidation.message
+                message: 'Please provide all required fields'
             });
         }
 
         // Validate claim amount
-        const amountValidation = validateClaimAmount(claim_amount, policy.remaining_amount);
-        if (!amountValidation.valid) {
-            await transaction.rollback();
+        if (claim_amount <= 0) {
             return res.status(400).json({
                 success: false,
-                message: amountValidation.message
+                message: 'Claim amount must be greater than 0'
             });
         }
 
         // Generate claim number
-        const claimNumber = `CLM${Date.now()}${customer.customer_id}`;
+        const claimNumber = `CLM${Date.now()}${req.user.user_id}`;
 
-        // Create claim
-        const claim = await ClaimRequest.create({
-            claim_number: claimNumber,
-            customer_id: customer.customer_id,
-            policy_id,
-            claim_amount,
-            claim_type,
-            treatment_type,
-            hospital_name,
-            admission_date,
-            discharge_date,
-            diagnosis,
-            claim_description,
-            status: 'DRAFT',
-            current_version: 1,
-            submitted_by: req.user.user_id
-        }, { transaction });
+        // Determine initial status
+        const status = submit ? 'SUBMITTED' : 'DRAFT';
 
-        // Create initial history record
-        await ClaimHistory.create({
-            claim_id: claim.claim_id,
-            version_number: 1,
-            claim_amount,
-            claim_description,
-            status: 'DRAFT',
-            changed_by: req.user.user_id,
-            change_reason: 'Initial claim creation',
-            snapshot_data: claim.toJSON()
-        }, { transaction });
+        // Insert claim into database
+        const [result] = await sequelize.query(
+            `INSERT INTO claim_request (
+                claim_number, claim_amount, claim_type, treatment_type,
+                hospital_name, diagnosis, claim_description, status,
+                admission_date, discharge_date, submitted_by,
+                submitted_at, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+            RETURNING claim_id, claim_number, claim_amount, claim_type, treatment_type,
+                      hospital_name, diagnosis, claim_description, status,
+                      admission_date, discharge_date, created_at`,
+            {
+                bind: [
+                    claimNumber,
+                    claim_amount,
+                    claim_type,
+                    treatment_type || null,
+                    hospital_name,
+                    diagnosis,
+                    claim_description || null,
+                    status,
+                    admission_date || null,
+                    discharge_date || null,
+                    req.user.user_id,
+                    submit ? new Date() : null
+                ]
+            }
+        );
 
-        // Create workflow record
-        await ClaimWorkflow.create({
-            claim_id: claim.claim_id,
-            from_status: null,
-            to_status: 'DRAFT',
-            action_by: req.user.user_id,
-            action_type: 'CREATE',
-            comments: 'Claim created as draft'
-        }, { transaction });
+        const claim = result[0];
 
-        await transaction.commit();
+        logger.info(`Claim ${status.toLowerCase()}: ${claimNumber} by user ${req.user.email}`);
 
         res.status(201).json({
             success: true,
-            message: 'Claim created successfully',
-            data: claim
+            message: `Claim ${status.toLowerCase()} successfully`,
+            data: {
+                claim: {
+                    ...claim,
+                    customer_name: req.user.full_name,
+                    customer_email: req.user.email
+                }
+            }
         });
 
     } catch (error) {
-        await transaction.rollback();
         logger.error('Error creating claim:', error);
         res.status(500).json({
             success: false,
@@ -152,59 +104,66 @@ const createClaim = async (req, res) => {
  */
 const getAllClaims = async (req, res) => {
     try {
-        const { status, page = 1, limit = 10, sortBy = 'created_at', order = 'DESC' } = req.query;
-        const offset = (page - 1) * limit;
+        const { status, page = 1, limit = 10 } = req.query;
 
-        let whereClause = {};
+        let whereClause = '';
+        let bindings = [];
 
         // Filter based on user role
         if (req.user.role === 'CUSTOMER') {
-            const customer = await CustomerMaster.findOne({
-                where: { user_id: req.user.user_id }
-            });
-            whereClause.customer_id = customer.customer_id;
+            whereClause = 'WHERE cr.submitted_by = $1';
+            bindings.push(req.user.user_id);
         } else if (req.user.role === 'AUDITOR') {
-            whereClause.status = ['SUBMITTED', 'UNDER_REVIEW', 'RESUBMITTED'];
+            whereClause = "WHERE cr.status IN ('SUBMITTED', 'UNDER_REVIEW', 'RESUBMITTED')";
         } else if (req.user.role === 'CASHIER') {
-            whereClause.status = ['APPROVED', 'PAYMENT_PROCESSING'];
+            whereClause = "WHERE cr.status IN ('APPROVED', 'PAYMENT_PROCESSING')";
         }
 
         // Add status filter if provided
         if (status) {
-            whereClause.status = status;
+            if (whereClause) {
+                whereClause += ` AND cr.status = $${bindings.length + 1}`;
+            } else {
+                whereClause = `WHERE cr.status = $${bindings.length + 1}`;
+            }
+            bindings.push(status);
         }
 
-        const { count, rows: claims } = await ClaimRequest.findAndCountAll({
-            where: whereClause,
-            include: [
-                {
-                    model: CustomerMaster,
-                    as: 'customer',
-                    include: [{
-                        model: User,
-                        as: 'user',
-                        attributes: ['user_id', 'full_name', 'email']
-                    }]
-                },
-                {
-                    model: InsurancePolicy,
-                    as: 'policy'
-                }
-            ],
-            limit: parseInt(limit),
-            offset: parseInt(offset),
-            order: [[sortBy, order]]
-        });
+        // Get total count
+        const [countResult] = await sequelize.query(
+            `SELECT COUNT(*) as total FROM claim_request cr ${whereClause}`,
+            { bind: bindings }
+        );
+        const total = parseInt(countResult[0].total);
+
+        // Get paginated claims
+        const offset = (page - 1) * limit;
+        bindings.push(parseInt(limit), offset);
+
+        const [claims] = await sequelize.query(
+            `SELECT 
+                cr.claim_id, cr.claim_number, cr.claim_amount, cr.claim_type,
+                cr.treatment_type, cr.hospital_name, cr.diagnosis,
+                cr.claim_description, cr.status, cr.admission_date,
+                cr.discharge_date, cr.created_at, cr.submitted_at,
+                u.full_name as customer_name, u.email as customer_email
+            FROM claim_request cr
+            LEFT JOIN users u ON cr.submitted_by = u.user_id
+            ${whereClause}
+            ORDER BY cr.created_at DESC
+            LIMIT $${bindings.length - 1} OFFSET $${bindings.length}`,
+            { bind: bindings }
+        );
 
         res.status(200).json({
             success: true,
             data: {
                 claims,
                 pagination: {
-                    total: count,
+                    total,
                     page: parseInt(page),
                     limit: parseInt(limit),
-                    totalPages: Math.ceil(count / limit)
+                    totalPages: Math.ceil(total / limit)
                 }
             }
         });
@@ -226,51 +185,38 @@ const getClaimById = async (req, res) => {
     try {
         const { claimId } = req.params;
 
-        const claim = await ClaimRequest.findByPk(claimId, {
-            include: [
-                {
-                    model: CustomerMaster,
-                    as: 'customer',
-                    include: [{
-                        model: User,
-                        as: 'user',
-                        attributes: ['user_id', 'full_name', 'email', 'phone']
-                    }]
-                },
-                {
-                    model: InsurancePolicy,
-                    as: 'policy'
-                },
-                {
-                    model: ClaimDocument,
-                    as: 'documents'
-                }
-            ]
-        });
+        const [claims] = await sequelize.query(
+            `SELECT 
+                cr.*, 
+                u.full_name as customer_name, 
+                u.email as customer_email,
+                u.phone as customer_phone
+            FROM claim_request cr
+            LEFT JOIN users u ON cr.submitted_by = u.user_id
+            WHERE cr.claim_id = $1`,
+            { bind: [claimId] }
+        );
 
-        if (!claim) {
+        if (claims.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Claim not found'
             });
         }
 
+        const claim = claims[0];
+
         // Check authorization
-        if (req.user.role === 'CUSTOMER') {
-            const customer = await CustomerMaster.findOne({
-                where: { user_id: req.user.user_id }
+        if (req.user.role === 'CUSTOMER' && claim.submitted_by !== req.user.user_id) {
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied'
             });
-            if (claim.customer_id !== customer.customer_id) {
-                return res.status(403).json({
-                    success: false,
-                    message: 'Access denied'
-                });
-            }
         }
 
         res.status(200).json({
             success: true,
-            data: claim
+            data: { claim }
         });
 
     } catch (error) {
@@ -287,70 +233,116 @@ const getClaimById = async (req, res) => {
  * Update claim (only draft or rejected claims)
  */
 const updateClaim = async (req, res) => {
-    const transaction = await sequelize.transaction();
-    
     try {
         const { claimId } = req.params;
         const updateData = req.body;
 
-        const claim = await ClaimRequest.findByPk(claimId, { transaction });
+        const [claims] = await sequelize.query(
+            'SELECT claim_id, status, submitted_by FROM claim_request WHERE claim_id = $1',
+            { bind: [claimId] }
+        );
 
-        if (!claim) {
-            await transaction.rollback();
+        if (claims.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Claim not found'
             });
         }
 
-        // Check if claim can be updated
-        if (!['DRAFT', 'REJECTED'].includes(claim.status)) {
-            await transaction.rollback();
-            return res.status(400).json({
-                success: false,
-                message: 'Only draft or rejected claims can be updated'
-            });
-        }
+        const claim = claims[0];
 
-        // Verify ownership
-        const customer = await CustomerMaster.findOne({
-            where: { user_id: req.user.user_id },
-            transaction
-        });
-
-        if (claim.customer_id !== customer.customer_id) {
-            await transaction.rollback();
+        // Check authorization
+        if (req.user.role === 'CUSTOMER' && claim.submitted_by !== req.user.user_id) {
             return res.status(403).json({
                 success: false,
                 message: 'Access denied'
             });
         }
 
-        // Update claim
-        await claim.update(updateData, { transaction });
+        // Only allow updates for DRAFT or REJECTED claims
+        if (!['DRAFT', 'REJECTED'].includes(claim.status)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Only draft or rejected claims can be updated'
+            });
+        }
 
-        // Create history record
-        await ClaimHistory.create({
-            claim_id: claim.claim_id,
-            version_number: claim.current_version,
-            claim_amount: claim.claim_amount,
-            claim_description: claim.claim_description,
-            status: claim.status,
-            changed_by: req.user.user_id,
-            change_reason: 'Claim updated',
-            snapshot_data: claim.toJSON()
-        }, { transaction });
+        // Build update query
+        const updates = [];
+        const bindings = [];
+        let bindIndex = 1;
 
-        await transaction.commit();
+        if (updateData.claim_amount !== undefined) {
+            updates.push(`claim_amount = $${bindIndex++}`);
+            bindings.push(parseFloat(updateData.claim_amount));
+        }
+        if (updateData.claim_type !== undefined) {
+            updates.push(`claim_type = $${bindIndex++}`);
+            bindings.push(updateData.claim_type);
+        }
+        if (updateData.treatment_type !== undefined) {
+            updates.push(`treatment_type = $${bindIndex++}`);
+            bindings.push(updateData.treatment_type);
+        }
+        if (updateData.hospital_name !== undefined) {
+            updates.push(`hospital_name = $${bindIndex++}`);
+            bindings.push(updateData.hospital_name);
+        }
+        if (updateData.diagnosis !== undefined) {
+            updates.push(`diagnosis = $${bindIndex++}`);
+            bindings.push(updateData.diagnosis);
+        }
+        if (updateData.claim_description !== undefined) {
+            updates.push(`claim_description = $${bindIndex++}`);
+            bindings.push(updateData.claim_description);
+        }
+        if (updateData.admission_date !== undefined) {
+            updates.push(`admission_date = $${bindIndex++}`);
+            bindings.push(updateData.admission_date || null);
+        }
+        if (updateData.discharge_date !== undefined) {
+            updates.push(`discharge_date = $${bindIndex++}`);
+            bindings.push(updateData.discharge_date || null);
+        }
+
+        // Update status if submit flag is true
+        if (updateData.submit) {
+            if (claim.status === 'DRAFT') {
+                updates.push(`status = $${bindIndex++}`);
+                bindings.push('SUBMITTED');
+                updates.push(`submitted_at = $${bindIndex++}`);
+                bindings.push(new Date());
+            } else if (claim.status === 'REJECTED') {
+                updates.push(`status = $${bindIndex++}`);
+                bindings.push('RESUBMITTED');
+                updates.push(`submitted_at = $${bindIndex++}`);
+                bindings.push(new Date());
+            }
+        }
+
+        updates.push(`updated_at = NOW()`);
+        bindings.push(claimId);
+
+        await sequelize.query(
+            `UPDATE claim_request SET ${updates.join(', ')} WHERE claim_id = $${bindIndex}`,
+            { bind: bindings }
+        );
+
+        // Fetch updated claim
+        const [updatedClaims] = await sequelize.query(
+            'SELECT * FROM claim_request WHERE claim_id = $1',
+            { bind: [claimId] }
+        );
+
+        logger.info(`Claim updated: ${updatedClaims[0].claim_number} by user ${req.user.email}`);
 
         res.status(200).json({
             success: true,
             message: 'Claim updated successfully',
-            data: claim
+            data: { claim: updatedClaims[0] }
         });
 
     } catch (error) {
-        await transaction.rollback();
         logger.error('Error updating claim:', error);
         res.status(500).json({
             success: false,
@@ -361,104 +353,114 @@ const updateClaim = async (req, res) => {
 };
 
 /**
- * Submit claim for review
+ * Delete claim (only draft claims)
  */
-const submitClaim = async (req, res) => {
-    const transaction = await sequelize.transaction();
-    
+const deleteClaim = async (req, res) => {
     try {
         const { claimId } = req.params;
 
-        const claim = await ClaimRequest.findByPk(claimId, {
-            include: [
-                { model: InsurancePolicy, as: 'policy' },
-                { model: ClaimDocument, as: 'documents' }
-            ],
-            transaction
-        });
+        const [claims] = await sequelize.query(
+            'SELECT claim_id, claim_number, status, submitted_by FROM claim_request WHERE claim_id = $1',
+            { bind: [claimId] }
+        );
 
-        if (!claim) {
-            await transaction.rollback();
+        if (claims.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Claim not found'
             });
         }
 
-        // Verify ownership
-        const customer = await CustomerMaster.findOne({
-            where: { user_id: req.user.user_id },
-            transaction
-        });
+        const claim = claims[0];
 
-        if (claim.customer_id !== customer.customer_id) {
-            await transaction.rollback();
+        // Check authorization
+        if (req.user.role === 'CUSTOMER' && claim.submitted_by !== req.user.user_id) {
             return res.status(403).json({
                 success: false,
                 message: 'Access denied'
             });
         }
 
-        // Check if claim is in submittable state
-        if (!['DRAFT', 'REJECTED'].includes(claim.status)) {
-            await transaction.rollback();
+        // Only allow deletion of DRAFT claims
+        if (claim.status !== 'DRAFT') {
             return res.status(400).json({
                 success: false,
-                message: 'Claim cannot be submitted in current state'
+                message: 'Only draft claims can be deleted'
             });
         }
 
-        // Validate documents
-        const docValidation = await validateDocuments(claim.claim_id);
-        if (!docValidation.valid) {
-            await transaction.rollback();
-            return res.status(400).json({
-                success: false,
-                message: docValidation.message,
-                missingDocuments: docValidation.missingDocuments
-            });
-        }
+        await sequelize.query(
+            'DELETE FROM claim_request WHERE claim_id = $1',
+            { bind: [claimId] }
+        );
 
-        // Calculate fraud risk score
-        const riskScore = await calculateRiskScore(claim);
-
-        // Update claim status
-        await claim.update({
-            status: 'SUBMITTED',
-            submitted_at: new Date()
-        }, { transaction });
-
-        // Create workflow record
-        await ClaimWorkflow.create({
-            claim_id: claim.claim_id,
-            from_status: claim.status === 'REJECTED' ? 'REJECTED' : 'DRAFT',
-            to_status: 'SUBMITTED',
-            action_by: req.user.user_id,
-            action_type: 'SUBMIT',
-            comments: 'Claim submitted for review'
-        }, { transaction });
-
-        // Send notification to auditors
-        await sendNotification({
-            type: 'CLAIM_SUBMITTED',
-            claimId: claim.claim_id,
-            recipientRole: 'AUDITOR',
-            message: `New claim ${claim.claim_number} submitted for review`
-        });
-
-        await transaction.commit();
+        logger.info(`Claim deleted: ${claim.claim_number} by user ${req.user.email}`);
 
         res.status(200).json({
             success: true,
-            message: 'Claim submitted successfully',
-            data: {
-                claim,
-                riskScore
-            }
+            message: 'Claim deleted successfully'
         });
 
     } catch (error) {
-        await transaction.rollback();
+        logger.error('Error deleting claim:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error deleting claim',
+            error: error.message
+        });
+    }
+};
+
+/**
+ * Submit claim for review
+ */
+const submitClaim = async (req, res) => {
+    try {
+        const { claimId } = req.params;
+
+        const [claims] = await sequelize.query(
+            'SELECT claim_id, claim_number, status, submitted_by FROM claim_request WHERE claim_id = $1',
+            { bind: [claimId] }
+        );
+
+        if (claims.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Claim not found'
+            });
+        }
+
+        const claim = claims[0];
+
+        // Check authorization
+        if (claim.submitted_by !== req.user.user_id) {
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied'
+            });
+        }
+
+        // Only allow submission of DRAFT claims
+        if (claim.status !== 'DRAFT') {
+            return res.status(400).json({
+                success: false,
+                message: 'Only draft claims can be submitted'
+            });
+        }
+
+        await sequelize.query(
+            'UPDATE claim_request SET status = $1, submitted_at = NOW(), updated_at = NOW() WHERE claim_id = $2',
+            { bind: ['SUBMITTED', claimId] }
+        );
+
+        logger.info(`Claim submitted: ${claim.claim_number} by user ${req.user.email}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Claim submitted successfully'
+        });
+
+    } catch (error) {
         logger.error('Error submitting claim:', error);
         res.status(500).json({
             success: false,
@@ -469,71 +471,79 @@ const submitClaim = async (req, res) => {
 };
 
 /**
- * Review claim (Auditor)
+ * Review claim (Auditor only)
  */
 const reviewClaim = async (req, res) => {
-    const transaction = await sequelize.transaction();
-    
     try {
         const { claimId } = req.params;
-        const { comments } = req.body;
+        const { action, comments, approved_amount } = req.body;
 
-        const claim = await ClaimRequest.findByPk(claimId, { transaction });
+        const [claims] = await sequelize.query(
+            'SELECT claim_id, claim_number, status, claim_amount FROM claim_request WHERE claim_id = $1',
+            { bind: [claimId] }
+        );
 
-        if (!claim) {
-            await transaction.rollback();
+        if (claims.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Claim not found'
             });
         }
 
-        if (claim.status !== 'SUBMITTED' && claim.status !== 'RESUBMITTED') {
-            await transaction.rollback();
-            return res.status(400).json({
+        const claim = claims[0];
+
+        // Only auditors can review
+        if (req.user.role !== 'AUDITOR') {
+            return res.status(403).json({
                 success: false,
-                message: 'Claim is not in reviewable state'
+                message: 'Only auditors can review claims'
             });
         }
 
-        // Update claim status
-        await claim.update({
-            status: 'UNDER_REVIEW',
-            reviewed_by: req.user.user_id,
-            reviewed_at: new Date()
-        }, { transaction });
-
-        // Add comment
-        if (comments) {
-            await ClaimComment.create({
-                claim_id: claim.claim_id,
-                user_id: req.user.user_id,
-                comment_text: comments,
-                comment_type: 'REVIEW',
-                is_visible_to_customer: true
-            }, { transaction });
+        // Only allow review of SUBMITTED or RESUBMITTED claims
+        if (!['SUBMITTED', 'RESUBMITTED', 'UNDER_REVIEW'].includes(claim.status)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Claim is not in reviewable status'
+            });
         }
 
-        // Create workflow record
-        await ClaimWorkflow.create({
-            claim_id: claim.claim_id,
-            from_status: claim.status === 'RESUBMITTED' ? 'RESUBMITTED' : 'SUBMITTED',
-            to_status: 'UNDER_REVIEW',
-            action_by: req.user.user_id,
-            action_type: 'REVIEW',
-            comments
-        }, { transaction });
+        let newStatus, updateQuery;
+        if (action === 'approve') {
+            newStatus = 'APPROVED';
+            updateQuery = `UPDATE claim_request 
+                          SET status = $1, reviewed_by = $2, approved_by = $3, 
+                              reviewed_at = NOW(), approved_at = NOW(), updated_at = NOW()
+                          WHERE claim_id = $4`;
+            await sequelize.query(updateQuery, {
+                bind: [newStatus, req.user.user_id, req.user.user_id, claimId]
+            });
+        } else if (action === 'reject') {
+            newStatus = 'REJECTED';
+            updateQuery = `UPDATE claim_request 
+                          SET status = $1, reviewed_by = $2, reviewed_at = NOW(), updated_at = NOW()
+                          WHERE claim_id = $3`;
+            await sequelize.query(updateQuery, {
+                bind: [newStatus, req.user.user_id, claimId]
+            });
+        } else if (action === 'request_info') {
+            newStatus = 'UNDER_REVIEW';
+            updateQuery = `UPDATE claim_request 
+                          SET status = $1, reviewed_by = $2, reviewed_at = NOW(), updated_at = NOW()
+                          WHERE claim_id = $3`;
+            await sequelize.query(updateQuery, {
+                bind: [newStatus, req.user.user_id, claimId]
+            });
+        }
 
-        await transaction.commit();
+        logger.info(`Claim ${action}: ${claim.claim_number} by auditor ${req.user.email}`);
 
         res.status(200).json({
             success: true,
-            message: 'Claim marked as under review',
-            data: claim
+            message: `Claim ${action} successfully`
         });
 
     } catch (error) {
-        await transaction.rollback();
         logger.error('Error reviewing claim:', error);
         res.status(500).json({
             success: false,
@@ -544,624 +554,107 @@ const reviewClaim = async (req, res) => {
 };
 
 /**
- * Approve claim (Auditor)
+ * Process payment (Cashier only)
  */
-const approveClaim = async (req, res) => {
-    const transaction = await sequelize.transaction();
-    
+const processPayment = async (req, res) => {
     try {
         const { claimId } = req.params;
-        const { approved_amount, comments } = req.body;
+        const { payment_method, transaction_id } = req.body;
 
-        const claim = await ClaimRequest.findByPk(claimId, {
-            include: [{ model: InsurancePolicy, as: 'policy' }],
-            transaction
-        });
+        const [claims] = await sequelize.query(
+            'SELECT claim_id, claim_number, status FROM claim_request WHERE claim_id = $1',
+            { bind: [claimId] }
+        );
 
-        if (!claim) {
-            await transaction.rollback();
+        if (claims.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Claim not found'
             });
         }
 
-        if (claim.status !== 'UNDER_REVIEW') {
-            await transaction.rollback();
-            return res.status(400).json({
-                success: false,
-                message: 'Claim must be under review to approve'
-            });
-        }
+        const claim = claims[0];
 
-        const finalAmount = approved_amount || claim.claim_amount;
-
-        // Validate approved amount
-        if (finalAmount > claim.policy.remaining_amount) {
-            await transaction.rollback();
-            return res.status(400).json({
-                success: false,
-                message: 'Approved amount exceeds remaining insurance coverage'
-            });
-        }
-
-        // Update claim status
-        await claim.update({
-            status: 'APPROVED',
-            approved_by: req.user.user_id,
-            approved_at: new Date()
-        }, { transaction });
-
-        // Update policy remaining amount
-        await claim.policy.update({
-            remaining_amount: claim.policy.remaining_amount - finalAmount
-        }, { transaction });
-
-        // Add approval comment
-        await ClaimComment.create({
-            claim_id: claim.claim_id,
-            user_id: req.user.user_id,
-            comment_text: comments || 'Claim approved',
-            comment_type: 'APPROVAL',
-            is_visible_to_customer: true
-        }, { transaction });
-
-        // Create workflow record
-        await ClaimWorkflow.create({
-            claim_id: claim.claim_id,
-            from_status: 'UNDER_REVIEW',
-            to_status: 'APPROVED',
-            action_by: req.user.user_id,
-            action_type: 'APPROVE',
-            comments
-        }, { transaction });
-
-        // Send notification to customer and cashier
-        await sendNotification({
-            type: 'CLAIM_APPROVED',
-            claimId: claim.claim_id,
-            recipientRole: ['CUSTOMER', 'CASHIER'],
-            message: `Claim ${claim.claim_number} has been approved`
-        });
-
-        await transaction.commit();
-
-        res.status(200).json({
-            success: true,
-            message: 'Claim approved successfully',
-            data: claim
-        });
-
-    } catch (error) {
-        await transaction.rollback();
-        logger.error('Error approving claim:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error approving claim',
-            error: error.message
-        });
-    }
-};
-
-/**
- * Reject claim (Auditor)
- */
-const rejectClaim = async (req, res) => {
-    const transaction = await sequelize.transaction();
-    
-    try {
-        const { claimId } = req.params;
-        const { reason, comments } = req.body;
-
-        if (!reason) {
-            return res.status(400).json({
-                success: false,
-                message: 'Rejection reason is required'
-            });
-        }
-
-        const claim = await ClaimRequest.findByPk(claimId, { transaction });
-
-        if (!claim) {
-            await transaction.rollback();
-            return res.status(404).json({
-                success: false,
-                message: 'Claim not found'
-            });
-        }
-
-        if (claim.status !== 'UNDER_REVIEW') {
-            await transaction.rollback();
-            return res.status(400).json({
-                success: false,
-                message: 'Claim must be under review to reject'
-            });
-        }
-
-        // Update claim status
-        await claim.update({
-            status: 'REJECTED',
-            reviewed_by: req.user.user_id,
-            reviewed_at: new Date()
-        }, { transaction });
-
-        // Add rejection comment
-        await ClaimComment.create({
-            claim_id: claim.claim_id,
-            user_id: req.user.user_id,
-            comment_text: `Rejection Reason: ${reason}\n${comments || ''}`,
-            comment_type: 'REJECTION',
-            is_visible_to_customer: true
-        }, { transaction });
-
-        // Create workflow record
-        await ClaimWorkflow.create({
-            claim_id: claim.claim_id,
-            from_status: 'UNDER_REVIEW',
-            to_status: 'REJECTED',
-            action_by: req.user.user_id,
-            action_type: 'REJECT',
-            comments: reason
-        }, { transaction });
-
-        // Send notification to customer
-        await sendNotification({
-            type: 'CLAIM_REJECTED',
-            claimId: claim.claim_id,
-            recipientRole: 'CUSTOMER',
-            message: `Claim ${claim.claim_number} has been rejected. Reason: ${reason}`
-        });
-
-        await transaction.commit();
-
-        res.status(200).json({
-            success: true,
-            message: 'Claim rejected',
-            data: claim
-        });
-
-    } catch (error) {
-        await transaction.rollback();
-        logger.error('Error rejecting claim:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error rejecting claim',
-            error: error.message
-        });
-    }
-};
-
-/**
- * Resubmit rejected claim (Customer)
- */
-const resubmitClaim = async (req, res) => {
-    const transaction = await sequelize.transaction();
-    
-    try {
-        const { claimId } = req.params;
-        const { resubmission_notes } = req.body;
-
-        const claim = await ClaimRequest.findByPk(claimId, { transaction });
-
-        if (!claim) {
-            await transaction.rollback();
-            return res.status(404).json({
-                success: false,
-                message: 'Claim not found'
-            });
-        }
-
-        // Verify ownership
-        const customer = await CustomerMaster.findOne({
-            where: { user_id: req.user.user_id },
-            transaction
-        });
-
-        if (claim.customer_id !== customer.customer_id) {
-            await transaction.rollback();
+        // Only cashiers can process payment
+        if (req.user.role !== 'CASHIER') {
             return res.status(403).json({
                 success: false,
-                message: 'Access denied'
+                message: 'Only cashiers can process payments'
             });
         }
 
-        if (claim.status !== 'REJECTED') {
-            await transaction.rollback();
+        // Only allow payment for APPROVED claims
+        if (claim.status !== 'APPROVED') {
             return res.status(400).json({
                 success: false,
-                message: 'Only rejected claims can be resubmitted'
+                message: 'Only approved claims can be paid'
             });
         }
 
-        // Increment version
-        const newVersion = claim.current_version + 1;
+        await sequelize.query(
+            `UPDATE claim_request 
+             SET status = $1, processed_by = $2, processed_at = NOW(), updated_at = NOW()
+             WHERE claim_id = $3`,
+            { bind: ['PAYMENT_DONE', req.user.user_id, claimId] }
+        );
 
-        // Update claim
-        await claim.update({
-            status: 'RESUBMITTED',
-            current_version: newVersion,
-            submitted_at: new Date()
-        }, { transaction });
-
-        // Create history record
-        await ClaimHistory.create({
-            claim_id: claim.claim_id,
-            version_number: newVersion,
-            claim_amount: claim.claim_amount,
-            claim_description: claim.claim_description,
-            status: 'RESUBMITTED',
-            changed_by: req.user.user_id,
-            change_reason: resubmission_notes || 'Claim resubmitted after corrections',
-            snapshot_data: claim.toJSON()
-        }, { transaction });
-
-        // Add comment
-        if (resubmission_notes) {
-            await ClaimComment.create({
-                claim_id: claim.claim_id,
-                user_id: req.user.user_id,
-                comment_text: resubmission_notes,
-                comment_type: 'QUERY',
-                is_visible_to_customer: true
-            }, { transaction });
-        }
-
-        // Create workflow record
-        await ClaimWorkflow.create({
-            claim_id: claim.claim_id,
-            from_status: 'REJECTED',
-            to_status: 'RESUBMITTED',
-            action_by: req.user.user_id,
-            action_type: 'RESUBMIT',
-            comments: resubmission_notes
-        }, { transaction });
-
-        // Send notification to auditors
-        await sendNotification({
-            type: 'CLAIM_RESUBMITTED',
-            claimId: claim.claim_id,
-            recipientRole: 'AUDITOR',
-            message: `Claim ${claim.claim_number} has been resubmitted (Version ${newVersion})`
-        });
-
-        await transaction.commit();
+        logger.info(`Payment processed: ${claim.claim_number} by cashier ${req.user.email}`);
 
         res.status(200).json({
             success: true,
-            message: 'Claim resubmitted successfully',
-            data: claim
+            message: 'Payment processed successfully'
         });
 
     } catch (error) {
-        await transaction.rollback();
-        logger.error('Error resubmitting claim:', error);
+        logger.error('Error processing payment:', error);
         res.status(500).json({
             success: false,
-            message: 'Error resubmitting claim',
+            message: 'Error processing payment',
             error: error.message
         });
     }
 };
 
 /**
- * Get claim history
+ * Get claim statistics
  */
-const getClaimHistory = async (req, res) => {
+const getClaimStats = async (req, res) => {
     try {
-        const { claimId } = req.params;
+        let whereClause = '';
+        const bindings = [];
 
-        const history = await ClaimHistory.findAll({
-            where: { claim_id: claimId },
-            include: [{
-                model: User,
-                as: 'changedBy',
-                attributes: ['user_id', 'full_name', 'role']
-            }],
-            order: [['changed_at', 'DESC']]
-        });
-
-        res.status(200).json({
-            success: true,
-            data: history
-        });
-
-    } catch (error) {
-        logger.error('Error fetching claim history:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error fetching claim history',
-            error: error.message
-        });
-    }
-};
-
-/**
- * Get claim workflow
- */
-const getClaimWorkflow = async (req, res) => {
-    try {
-        const { claimId } = req.params;
-
-        const workflow = await ClaimWorkflow.findAll({
-            where: { claim_id: claimId },
-            include: [{
-                model: User,
-                as: 'actionBy',
-                attributes: ['user_id', 'full_name', 'role']
-            }],
-            order: [['created_at', 'ASC']]
-        });
-
-        res.status(200).json({
-            success: true,
-            data: workflow
-        });
-
-    } catch (error) {
-        logger.error('Error fetching claim workflow:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error fetching claim workflow',
-            error: error.message
-        });
-    }
-};
-
-/**
- * Add comment to claim
- */
-const addComment = async (req, res) => {
-    try {
-        const { claimId } = req.params;
-        const { comment_text, comment_type = 'QUERY', is_visible_to_customer = true } = req.body;
-
-        if (!comment_text) {
-            return res.status(400).json({
-                success: false,
-                message: 'Comment text is required'
-            });
-        }
-
-        const comment = await ClaimComment.create({
-            claim_id: claimId,
-            user_id: req.user.user_id,
-            comment_text,
-            comment_type,
-            is_visible_to_customer
-        });
-
-        res.status(201).json({
-            success: true,
-            message: 'Comment added successfully',
-            data: comment
-        });
-
-    } catch (error) {
-        logger.error('Error adding comment:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error adding comment',
-            error: error.message
-        });
-    }
-};
-
-/**
- * Get all comments for a claim
- */
-const getComments = async (req, res) => {
-    try {
-        const { claimId } = req.params;
-
-        let whereClause = { claim_id: claimId };
-
-        // Customers can only see comments visible to them
+        // Filter by user role
         if (req.user.role === 'CUSTOMER') {
-            whereClause.is_visible_to_customer = true;
+            whereClause = 'WHERE submitted_by = $1';
+            bindings.push(req.user.user_id);
         }
 
-        const comments = await ClaimComment.findAll({
-            where: whereClause,
-            include: [{
-                model: User,
-                as: 'user',
-                attributes: ['user_id', 'full_name', 'role']
-            }],
-            order: [['created_at', 'DESC']]
-        });
+        const [stats] = await sequelize.query(
+            `SELECT 
+                COUNT(*) as total,
+                COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) as draft,
+                COUNT(CASE WHEN status = 'SUBMITTED' THEN 1 END) as submitted,
+                COUNT(CASE WHEN status = 'UNDER_REVIEW' THEN 1 END) as under_review,
+                COUNT(CASE WHEN status = 'APPROVED' THEN 1 END) as approved,
+                COUNT(CASE WHEN status = 'REJECTED' THEN 1 END) as rejected,
+                COUNT(CASE WHEN status = 'PAYMENT_DONE' THEN 1 END) as paid,
+                COALESCE(SUM(claim_amount), 0) as total_amount,
+                COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN claim_amount ELSE 0 END), 0) as approved_amount
+            FROM claim_request
+            ${whereClause}`,
+            { bind: bindings }
+        );
 
         res.status(200).json({
             success: true,
-            data: comments
+            data: { stats: stats[0] }
         });
 
     } catch (error) {
-        logger.error('Error fetching comments:', error);
+        logger.error('Error fetching claim stats:', error);
         res.status(500).json({
             success: false,
-            message: 'Error fetching comments',
-            error: error.message
-        });
-    }
-};
-
-/**
- * Get claims by customer
- */
-const getClaimsByCustomer = async (req, res) => {
-    try {
-        const { customerId } = req.params;
-
-        // Check authorization
-        if (req.user.role === 'CUSTOMER') {
-            const customer = await CustomerMaster.findOne({
-                where: { user_id: req.user.user_id }
-            });
-            if (customer.customer_id !== parseInt(customerId)) {
-                return res.status(403).json({
-                    success: false,
-                    message: 'Access denied'
-                });
-            }
-        }
-
-        const claims = await ClaimRequest.findAll({
-            where: { customer_id: customerId },
-            include: [
-                { model: InsurancePolicy, as: 'policy' }
-            ],
-            order: [['created_at', 'DESC']]
-        });
-
-        res.status(200).json({
-            success: true,
-            data: claims
-        });
-
-    } catch (error) {
-        logger.error('Error fetching customer claims:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error fetching customer claims',
-            error: error.message
-        });
-    }
-};
-
-/**
- * Get dashboard statistics
- */
-const getDashboardStats = async (req, res) => {
-    try {
-        let stats = {};
-
-        if (req.user.role === 'CUSTOMER') {
-            const customer = await CustomerMaster.findOne({
-                where: { user_id: req.user.user_id }
-            });
-
-            stats = await ClaimRequest.findAll({
-                where: { customer_id: customer.customer_id },
-                attributes: [
-                    'status',
-                    [sequelize.fn('COUNT', sequelize.col('claim_id')), 'count'],
-                    [sequelize.fn('SUM', sequelize.col('claim_amount')), 'total_amount']
-                ],
-                group: ['status'],
-                raw: true
-            });
-
-        } else if (req.user.role === 'AUDITOR') {
-            stats = await ClaimRequest.findAll({
-                where: {
-                    status: ['SUBMITTED', 'UNDER_REVIEW', 'RESUBMITTED']
-                },
-                attributes: [
-                    'status',
-                    [sequelize.fn('COUNT', sequelize.col('claim_id')), 'count']
-                ],
-                group: ['status'],
-                raw: true
-            });
-
-        } else if (req.user.role === 'CASHIER') {
-            stats = await ClaimRequest.findAll({
-                where: {
-                    status: ['APPROVED', 'PAYMENT_PROCESSING']
-                },
-                attributes: [
-                    'status',
-                    [sequelize.fn('COUNT', sequelize.col('claim_id')), 'count'],
-                    [sequelize.fn('SUM', sequelize.col('claim_amount')), 'total_amount']
-                ],
-                group: ['status'],
-                raw: true
-            });
-
-        } else if (req.user.role === 'ADMIN') {
-            stats = await ClaimRequest.findAll({
-                attributes: [
-                    'status',
-                    [sequelize.fn('COUNT', sequelize.col('claim_id')), 'count'],
-                    [sequelize.fn('SUM', sequelize.col('claim_amount')), 'total_amount']
-                ],
-                group: ['status'],
-                raw: true
-            });
-        }
-
-        res.status(200).json({
-            success: true,
-            data: stats
-        });
-
-    } catch (error) {
-        logger.error('Error fetching dashboard stats:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error fetching dashboard stats',
-            error: error.message
-        });
-    }
-};
-
-/**
- * Delete claim (only draft claims)
- */
-const deleteClaim = async (req, res) => {
-    const transaction = await sequelize.transaction();
-    
-    try {
-        const { claimId } = req.params;
-
-        const claim = await ClaimRequest.findByPk(claimId, { transaction });
-
-        if (!claim) {
-            await transaction.rollback();
-            return res.status(404).json({
-                success: false,
-                message: 'Claim not found'
-            });
-        }
-
-        // Only draft claims can be deleted
-        if (claim.status !== 'DRAFT') {
-            await transaction.rollback();
-            return res.status(400).json({
-                success: false,
-                message: 'Only draft claims can be deleted'
-            });
-        }
-
-        // Verify ownership or admin
-        if (req.user.role !== 'ADMIN') {
-            const customer = await CustomerMaster.findOne({
-                where: { user_id: req.user.user_id },
-                transaction
-            });
-            if (claim.customer_id !== customer.customer_id) {
-                await transaction.rollback();
-                return res.status(403).json({
-                    success: false,
-                    message: 'Access denied'
-                });
-            }
-        }
-
-        await claim.destroy({ transaction });
-        await transaction.commit();
-
-        res.status(200).json({
-            success: true,
-            message: 'Claim deleted successfully'
-        });
-
-    } catch (error) {
-        await transaction.rollback();
-        logger.error('Error deleting claim:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error deleting claim',
+            message: 'Error fetching claim statistics',
             error: error.message
         });
     }
@@ -1172,18 +665,11 @@ module.exports = {
     getAllClaims,
     getClaimById,
     updateClaim,
+    deleteClaim,
     submitClaim,
     reviewClaim,
-    approveClaim,
-    rejectClaim,
-    resubmitClaim,
-    getClaimHistory,
-    getClaimWorkflow,
-    addComment,
-    getComments,
-    getClaimsByCustomer,
-    getDashboardStats,
-    deleteClaim
+    processPayment,
+    getClaimStats
 };
 
 // Made with Bob

@@ -77,105 +77,26 @@ router.post(
 );
 
 /**
- * @route   POST /api/v1/claims/:claimId/approve
- * @desc    Approve claim (Auditor)
- * @access  Private (Auditor)
+ * @route   POST /api/v1/claims/:claimId/payment
+ * @desc    Process payment for approved claim (Cashier)
+ * @access  Private (Cashier)
  */
 router.post(
-    '/:claimId/approve',
+    '/:claimId/payment',
     authenticate,
-    authorize('AUDITOR'),
-    claimController.approveClaim
+    authorize('CASHIER'),
+    claimController.processPayment
 );
 
 /**
- * @route   POST /api/v1/claims/:claimId/reject
- * @desc    Reject claim (Auditor)
- * @access  Private (Auditor)
- */
-router.post(
-    '/:claimId/reject',
-    authenticate,
-    authorize('AUDITOR'),
-    claimController.rejectClaim
-);
-
-/**
- * @route   POST /api/v1/claims/:claimId/resubmit
- * @desc    Resubmit rejected claim (Customer)
- * @access  Private (Customer)
- */
-router.post(
-    '/:claimId/resubmit',
-    authenticate,
-    authorize('CUSTOMER'),
-    claimController.resubmitClaim
-);
-
-/**
- * @route   GET /api/v1/claims/:claimId/history
- * @desc    Get claim history/audit trail
+ * @route   GET /api/v1/claims/stats
+ * @desc    Get claim statistics
  * @access  Private
  */
 router.get(
-    '/:claimId/history',
+    '/stats',
     authenticate,
-    claimController.getClaimHistory
-);
-
-/**
- * @route   GET /api/v1/claims/:claimId/workflow
- * @desc    Get claim workflow status
- * @access  Private
- */
-router.get(
-    '/:claimId/workflow',
-    authenticate,
-    claimController.getClaimWorkflow
-);
-
-/**
- * @route   POST /api/v1/claims/:claimId/comments
- * @desc    Add comment to claim
- * @access  Private
- */
-router.post(
-    '/:claimId/comments',
-    authenticate,
-    claimController.addComment
-);
-
-/**
- * @route   GET /api/v1/claims/:claimId/comments
- * @desc    Get all comments for a claim
- * @access  Private
- */
-router.get(
-    '/:claimId/comments',
-    authenticate,
-    claimController.getComments
-);
-
-/**
- * @route   GET /api/v1/claims/customer/:customerId
- * @desc    Get all claims for a customer
- * @access  Private (Customer or Admin)
- */
-router.get(
-    '/customer/:customerId',
-    authenticate,
-    claimController.getClaimsByCustomer
-);
-
-/**
- * @route   GET /api/v1/claims/stats/dashboard
- * @desc    Get dashboard statistics
- * @access  Private
- */
-router.get(
-    '/stats/dashboard',
-    authenticate,
-    claimController.getDashboardStats
+    claimController.getClaimStats
 );
 
 /**

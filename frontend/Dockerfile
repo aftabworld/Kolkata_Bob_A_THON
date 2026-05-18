@@ -15,6 +15,10 @@ RUN npm install --legacy-peer-deps
 # Copy application code
 COPY . .
 
+# Set build-time environment variable
+ARG REACT_APP_API_URL=http://localhost:5000/api/v1
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
+
 # Build the application
 RUN npm run build
 

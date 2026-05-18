@@ -9,6 +9,7 @@ const ClaimComment = {};
 const ClaimWorkflow = {};
 const ClaimDocument = {};
 const User = {};
+const FraudDetectionLog = {};
 
 module.exports = {
   ClaimRequest,
@@ -18,7 +19,8 @@ module.exports = {
   ClaimComment,
   ClaimWorkflow,
   ClaimDocument,
-  User
+  User,
+  FraudDetectionLog
 };
 
 // Made with Bob
